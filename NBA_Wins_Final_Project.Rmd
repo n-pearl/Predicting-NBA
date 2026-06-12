@@ -1,6 +1,6 @@
 ---
 title: "Predicting NBA Regular Season Win Totals"
-author: "Noah Pearl - A055X49"
+author: "Noah Pearl"
 date: "June 10, 2026"
 output:
   html_document:
@@ -12,7 +12,6 @@ output:
   pdf_document:
     toc: true
     toc_depth: '3'
-subtitle: "PSTAT 131 Final Project"
 ---
 
 ```{r setup, include=FALSE}
