@@ -1,0 +1,463 @@
+---
+title: "Predicting NBA Regular Season Win Totals"
+author: "Noah Pearl - A055X49"
+date: "June 10, 2026"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    code_folding: show
+    theme: flatly
+  pdf_document:
+    toc: true
+    toc_depth: '3'
+subtitle: "PSTAT 131 Final Project"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.align = "center",
+  fig.width = 8,
+  fig.height = 5,
+  cache = TRUE
+)
+
+#Packages 
+library(tidyverse)
+library(tidymodels)
+library(janitor) 
+library(corrplot) 
+library(naniar) 
+library(vip) 
+library(ranger)
+library(xgboost)
+library(glmnet) 
+library(kableExtra)
+
+tidymodels_prefer()
+set.seed(113) 
+```
+
+# Introduction
+
+Every spring, as playoff seeds get set and then the bracket thins out, the same debate resurfaces among basketball fans: what actually separates a championship-caliber team from a pretender? Over an 82-game regular season, we can assume luck and travel balance out and we are left with a hopefully honest record of how good any one team is. Yet "good" is a slippery word. A team can win 50 games by outscoring every opponent on offense, by choking them on defense, by simply not getting injured, or by some middle ground of all three and beyond. This project asks which team characteristics, that we *can* measure, most reliably produce regular-season wins. Just as importantly, how confident can we be that those relationships mean anything?
+
+There are a few terms worth defining fjrst for readers who don't follow basketball closely. A regular season consists of 82 games, and a team's win total - an integer from 0 to 82 - is the outcome this project predicts. Because the pace of play (the number of possessions a team uses per game) has shifted substantially in the last two decades, raw totals like "points per game" are misleading. Among two teams that shoot with the same percentage of makes, the faster one will post very different stats. To correct for this, we work in per-100-possessions terms, which puts every team on common ground regardless of tempo. We also rely on several advanced metrics: Offensive Rating (ORtg, points scored per 100 possessions) and Defensive Rating (DRtg, points allowed per 100), their difference Net Rating, True Shooting percentage (TS%, a shooting-efficiency measure that properly credits three-pointers and free throws), and the Simple Rating System (SRS, a team's average scoring margin adjusted for strength of schedule).
+
+We do to be honest about a complication these advanced metrics present. Several of them (Net Rating, SRS, ORtg/DRtg) are tied to wins almost by construction, because outscoring opponents is, mechanically, how games are won. For us to introduce a model that "discovers" Net Rating predicts wins would neither be interesting nor profound. This project therefore frames its goal with care: rather than scraping for hidden drivers of success, we set out to quantify and rank known relationships, and to ask how much of a team's win total can be recovered from the underlying box-score components (shooting, rebounding, ball-handling, defense) alone, once the summary margin statistics are stripped away? To address this directly, every model is fit twice: once on a full set of the predictors that includes the margin metrics, and once on a pure set restricted to the box-score fundamentals that produce them. The gap between the two *is* worthy of being introduced.
+
+The primary goal, therefore, is to build and then compare regression models that predict win totals across roughly 800 team-seasons from 1999-2000 through 2025-2026, using team statistics scraped from Basketball Reference. 
+
+
+**Project Roadmap.**
+
+- **EDA** - distributions, correlation structure, and era trends.
+- **Setup** - an 80/20 stratified split and 10-fold stratified cross-validation.
+- **Two recipes** - a *full* predictor set and a *pure* set.
+- **Four model types** - linear regression, elastic net, random forest, gradient boosted trees.
+- **Results** - quantifying the full-vs-pure gap, test-set evaluation of the best workflow(s).
+
+---
+
+# Data and Citation
+
+> Basketball Reference. *NBA Team Stats: Per 100 Possessions, Advanced, and Standings, 2000–2024.* Sports Reference LLC. https://www.basketball-reference.com/
+
+The data are sourced from the **Team Per 100 Poss** and **Team Advanced** tables, joined to the **Standings** table for win totals. Each row is one team's single season; across ~25 seasons and 30 teams this yields roughly 805 team-season observations. The tables are publicly available and exported as CSV.
+
+---
+
+# Loading and Tidying the Data
+
+```{r load-data}
+nba_raw <- read_csv("data/nba_team_season.csv")
+
+glimpse(nba_raw)
+```
+
+```{r tidy-data}
+nba <- nba_raw |>
+  transmute(
+    season, team, wins,                       
+    era = cut(season,
+              breaks = c(1999, 2007, 2014, 2026),
+              labels = c("2000-2007", "2008-2014", "2015-2026")),
+    age, pace, sos, off_rtg, 
+    def_rtg, net_rtg, srs,
+    ts_pct, efg_pct,
+    fg3ar = fg3a_per_fga_pct,
+    ftr = fta_per_fga_pct,
+    tov_pct, orb_pct, ast, stl, blk,
+    opp_efg_pct, opp_tov_pct, opp_ft_rate, drb_pct
+  )
+
+dim(nba)
+colSums(is.na(nba))
+```
+
+The scraped dataset contains 805 team-seasons described by 78 columns, which is far more than this needs. We trim it down to a set of 24 variables: one outcome (wins), two identifiers (season, team), and 21 predictors falling into three groups. The context group (age, pace, sos) captures the circumstances that shaped a season outside of directly stating performance. The margin/derived group (off_rtg, def_rtg, net_rtg, srs) holds the summary efficiency metrics which are retained in the full model but deliberately removed in the pure model. The pure component group covers the box-score fundamentals: Shooting efficiency (ts_pct, efg_pct), shot selection (fg3ar, ftr), ball control (tov_pct), rebounding (orb_pct, drb_pct), playmaking and disruption (ast, stl, blk), and the corresponding opponent rates (opp_efg_pct, opp_tov_pct, opp_ft_rate) that paint defensive quality.
+
+Several raw columns were dropped before modeling because they are basically restatements of our answer. A team's losses are simply 82 - wins; the Pythagorean estimates wins_pyth and losses_pyth are derived directly from points scored and allowed; and margin of victory (mov) is the scoring margin that wins follow from. The per-100-possession pts and opponent pts columns are numerically identical to Offensive and Defensive Rating.
+
+---
+
+# Exploratory Data Analysis
+
+## Missing Data
+
+```{r missing-data}
+colSums(is.na(nba))
+```
+This dataset has no missing values. Because it is assembled directly from Basketball Reference's complete team-season tables, every one of the 805 team-seasons has a recorded value for all 24 variables. 
+
+## Visual EDA
+
+### Distribution of Win Totals
+
+```{r eda-wins-hist}
+ggplot(nba, aes(wins)) +
+  geom_histogram(bins = 25, fill = "steelblue", color = "white") +
+  labs(title = "Distribution of Regular Season Win Totals",
+       x = "Wins", y = "Count")
+```
+
+Win totals are roughly symmetric and centered around 41, which makes sense. Every game produces one win and one loss, so the league average is pretty much pinned at half of 82. The absence of significant skew makes win total a well-behaved target for a continuous regression outcome.
+
+### Correlation Structure
+
+```{r eda-corr}
+nba |>
+  select(where(is.numeric)) |>
+  cor(use = "pairwise.complete.obs") |>
+  corrplot(method = "color", type = "upper",
+           tl.cex = 0.6, tl.col = "black",
+           title = "Correlation Matrix of Numeric Predictors",
+           mar = c(0, 0, 1, 0))
+```
+
+The `wins` row makes the project's main complication obvious at first glance: both Net Rating and SRS are its darkest cells. Correlating with wins with a score almost 1 makes these basically equal to it. 
+
+True Shooting and eFG% correlate positively but moderately, and opponent shooting efficiency and turnover rate negatively, and they're much less related with one another. This is why we remove the margin stats in the pure recipe, because only then is the model forced to genuinely rebuild team quality.
+
+### Net Rating vs. Wins
+
+```{r eda-netrtg}
+ggplot(nba, aes(net_rtg, wins)) +
+  geom_point(alpha = 0.4) +
+  geom_smooth(method = "lm", se = FALSE) +
+  labs(title = "Net Rating vs. Wins", x = "Net Rating", y = "Wins")
+```
+
+Net rating and wings fall almost perfectly on a straight line, reinforcing our earlier takes.
+
+### True Shooting % vs. Wins
+
+```{r eda-ts}
+ggplot(nba, aes(ts_pct, wins)) +
+  geom_point(alpha = 0.4) +
+  geom_smooth(method = "lm", se = FALSE) +
+  labs(title = "True Shooting % vs. Wins", x = "TS%", y = "Wins")
+```
+
+Plotting against a "pure" efficiency metric, we can see that wins trend positively with it, but the cloud is much more diffused. Efficient-shooting teams win more on average, yet plenty of efficient teams miss 40 wins and some decent shooters reach 60, because shooting is only one part of winning. 
+
+
+### League-Wide Three-Point Attempt Rate Over Time
+
+```{r eda-3par-trend}
+nba |>
+  group_by(season) |>
+  summarise(mean_3par = mean(fg3ar, na.rm = TRUE)) |>
+  ggplot(aes(season, mean_3par)) +
+  geom_line(linewidth = 1, color = "firebrick") +
+  geom_point() +
+  labs(title = "Average 3-Point Attempt Rate by Season",
+       x = "Season", y = "Mean 3PAr")
+```
+
+The league-wide three-point attempt rate climbs steadily through the 2000s, plateaus briefly in the early 2010s, then shoots up sharply after 2014 before leveling off near the top of the range in the most recent seasons. This is the single clearest structural change in how the game is played over our window of time. 
+
+### Turnover Rate vs. Wins
+
+```{r eda-tov}
+ggplot(nba, aes(tov_pct, wins)) +
+  geom_point(alpha = 0.4) +
+  geom_smooth(method = "lm", se = FALSE) +
+  labs(title = "Turnover Rate vs. Wins", x = "Turnover %", y = "Wins")
+```
+
+Turnover rate slopes clearly downward against wins, which makes sense as teams that give the ball over more create more chances for their opponents to score. The relationship is real but loose, similar to TS%. 
+
+---
+
+# Setting Up the Models
+
+## Train/Test Split
+
+```{r split}
+set.seed(113)
+nba_split <- initial_split(nba, prop = 0.80, strata = wins)
+nba_train <- training(nba_split)
+nba_test  <- testing(nba_split)
+
+c(train = nrow(nba_train), test = nrow(nba_test))
+```
+
+We allocate 80% of the 805 team-seasons to training and hold out 20% for a single final evaluation. The split is stratified on wins so that the rare very-good and very-bad teams are proportionally represented in both sets. Without stratification, an unlucky draw could concentrate the 65-win or 17-win seasons entirely in one partition and warp either training or evaluation.
+
+## Cross-Validation Folds
+
+```{r folds}
+set.seed(113)
+nba_folds <- vfold_cv(nba_train, v = 10, strata = wins)
+nba_folds
+```
+
+We resample the training set with 10-fold cross-validation, again stratified on wins. Every model and hyperparameter combination is judged by its average performance across these ten held-out folds, which gives a far more stable estimate of error than a single validation split and protects us from overfitting to any one particular slice of the data. The test set is never touched.
+
+## Two Recipes: Full vs. Pure
+
+```{r recipes}
+# FULL: 
+rec_full <- recipe(wins ~ ., data = nba_train) |>
+  update_role(team, season, new_role = "id") |> # keep but don't model on
+  step_rm(era) |> # not predictor
+  step_dummy(all_nominal_predictors()) |>
+  step_zv(all_predictors()) |>
+  step_normalize(all_numeric_predictors())
+
+# PURE:
+rec_pure <- rec_full |>
+  step_rm(net_rtg, srs, off_rtg, def_rtg)
+
+rec_full |> prep() |> bake(new_data = NULL) |> ncol()
+rec_pure |> prep() |> bake(new_data = NULL) |> ncol()
+```
+Both of the two recipes treat team and season as identifiers rather than predictors, drop the era label, dummy-encode any categorical features, and normalize all predictors so that the models are not misled by variables measured with different units. Then the full recipe keeps everything while the pure recipe removes Net Rating, SRS, and Offensive and Defensive Rating. Comparing these two models is how we can predict the wins from the fundamentals. 
+
+---
+
+# Model Building
+
+We fit four model types through both recipes (4 × 2 = 8 workflows) using a `workflow_set`.
+
+## Model Specifications
+
+```{r model-specs}
+# Linear regression (not tuned)
+lm_spec <- linear_reg() |>
+  set_engine("lm")
+
+# Elastic net (tune penalty + mixture)
+en_spec <- linear_reg(penalty = tune(), mixture = tune()) |>
+  set_engine("glmnet")
+
+# Random forest (tune mtry, trees, min_n)
+rf_spec <- rand_forest(mtry = tune(), trees = tune(), min_n = tune()) |>
+  set_engine("ranger", importance = "impurity") |>
+  set_mode("regression")
+
+# Gradient boosted trees (tune trees, tree_depth, learn_rate)
+bt_spec <- boost_tree(trees = tune(), tree_depth = tune(), learn_rate = tune()) |>
+  set_engine("xgboost") |>
+  set_mode("regression")
+```
+
+## Assembling the Workflow Set
+
+```{r workflow-set}
+nba_wfs <- workflow_set(
+  preproc = list(full = rec_full, pure = rec_pure),
+  models  = list(lm = lm_spec, enet = en_spec, rf = rf_spec, bt = bt_spec),
+  cross   = TRUE
+)
+nba_wfs
+```
+
+## Tuning
+
+```{r tune, results='hide'}
+grid_ctrl <- control_grid(save_pred = TRUE, save_workflow = TRUE)
+
+set.seed(113)
+nba_res <- nba_wfs |>
+  workflow_map(
+    "tune_grid",
+    resamples = nba_folds,
+    grid = 20,
+    metrics = metric_set(rmse, rsq),
+    control = grid_ctrl,
+    verbose = TRUE
+  )
+```
+
+## Tuning Autoplots
+
+```{r tune-autoplots}
+# Per-model tuning behavior
+autoplot(nba_res, id = "full_enet") + labs(title = "Elastic Net")
+autoplot(nba_res, id = "full_rf")   + labs(title = "Random Forest")
+autoplot(nba_res, id = "full_bt")   + labs(title = "Boosted Trees")
+```
+Elastic Net:
+  - Elastic net regression is pretty flat across the grid, hovering around an RMSE of 3.55 and oscillating around an R-Squared of 0.9196, telling us the mild regularization neither helps nor hurts. 
+  
+Random Forest:
+  - Random forest's RMSE drops sharply until holding out after `mtry` equals 5, and the R-Squared rises the same. Both tree count and minimal node size don't seem to have any effect at all. 
+  
+Boosted Trees:
+  - Interestingly, only tree depth appears to have any noticeable effects, and in particular only on R-Squared, where increasing depth *lowers* the values from 0.92 to 0.89. 
+  
+Based on the observable nearly linear nature of many of these performance metrics with Net Rating and SRS present, these results make sense. Elastic net's floor of RMSE is also much lower than that of Random Forest and Boosted Trees. 
+
+
+---
+
+# Model Results
+
+## Cross-Validated Comparison (the central finding)
+
+```{r results-table}
+collect_metrics(nba_res) |>
+  filter(.metric == "rmse") |>
+  group_by(wflow_id) |>
+  slice_min(mean, n = 1) |> 
+  ungroup() |>
+  separate(wflow_id, into = c("recipe", "model"), sep = "_", remove = FALSE) |>
+  select(recipe, model, rmse = mean, std_err) |>
+  arrange(recipe, rmse) |>
+  kbl(digits = 3, caption = "Best CV RMSE per workflow (lower is better)") |>
+  kable_styling(full_width = FALSE)
+```
+
+Under the full recipe, every model achieves a very low cross-validated RMSE of roughly 3.6 wins, with full_enet edging out the rest. This is expected, since these models have direct access to the margin metrics. The pure models are meaningfully worse, with the best pure model, still enet, posting an RMSE of about 3.62 wins. The real thing of interest here is that the pure_enet model only performed slightly worse than all of the full models. 
+
+```{r results-rank-plot}
+autoplot(nba_res, metric = "rmse") +
+  labs(title = "Workflow comparison - CV RMSE")
+```
+
+
+
+## Finalizing the Best Workflows
+
+```{r finalize-best-full}
+best_id <- rank_results(nba_res, rank_metric = "rmse") |>
+  filter(.metric == "rmse") |>
+  slice_min(rank, n = 1) |>
+  pull(wflow_id)
+best_id
+
+best_wf <- extract_workflow(nba_res, id = best_id)
+best_params <- nba_res |>
+  extract_workflow_set_result(best_id) |>
+  select_best(metric = "rmse")
+
+final_wf <- finalize_workflow(best_wf, best_params)
+```
+```{r finalize-best-pure}
+best_pure_id <- rank_results(nba_res, rank_metric = "rmse") |>
+  filter(.metric == "rmse", str_starts(wflow_id, "pure_")) |>
+  slice_min(rank, n = 1) |>
+  pull(wflow_id)
+
+best_pure_id
+
+best_pure_wf <- extract_workflow(nba_res, id = best_pure_id)
+best_pure_params <- nba_res |>
+  extract_workflow_set_result(best_pure_id) |>
+  select_best(metric = "rmse")
+
+final_pure_wf  <- finalize_workflow(best_pure_wf, best_pure_params)
+```
+
+## Test-Set Evaluation
+
+```{r test-fit-full}
+final_fit <- last_fit(final_wf, split = nba_split,
+                      metrics = metric_set(rmse, rsq))
+
+collect_metrics(final_fit) |>
+  kbl(digits = 3, caption = "Test-set performance of the best FULL workflow") |>
+  kable_styling(full_width = FALSE)
+```
+
+```{r test-fit-pure}
+final_pure_fit <- last_fit(final_pure_wf, split = nba_split,
+                           metrics = metric_set(rmse, rsq))
+collect_metrics(final_pure_fit) |>
+  kbl(digits = 3,
+      caption = "Test-set performance of the best PURE workflow") |>
+  kable_styling(full_width = FALSE)
+```
+
+On the held-out test set the two finalized models are all but indistinguishable, but specifically the pure model is marginally the better of the two! An RMSE of 3.34 wins against the full model's 3.35, both explaining 92.1% of the variance in win totals (R_Squared = 0.921). Either model predicts a team's season win total to within about 3.3 wins on data it never saw.
+
+We anticipated the full model, armed with near-perfect Net Rating and SRS, would set a bar the pure model could never reach. Instead the box-score fundamentals alone reconstruct win totals just as accurately, with no penalty for dropping anything. Net Rating is itself a conglomerate of the fundamentals, so once those are in the model removing it changes nothing. The fact that the full model didn't win is also reassuring that it wasn't overfitting to those predictors.
+
+---
+
+# Best Model Deep Dive
+
+## Variable Importance
+
+```{r vip-full}
+final_fit |>
+  extract_fit_parsnip() |>
+  vip(num_features = 15) +
+  labs(title = "Variable Importance - best FULL model")
+```
+
+```{r vip-pure}
+final_pure_fit |>
+  extract_fit_parsnip() |>
+  vip(num_features = 15) +
+  labs(title = "Variable Importance - best PURE model")
+```
+
+The importance plots explain why. In the full model Net Rating dominates every other predictor, again reflecting their near-equivalence with wins. Without those, the pure model leans on ts_pct, opp_efg_pct, and tov_pct: offensive efficiency, defensive efficiency, and ball control. These are precisely the components the margin metrics were summarizing. The two plots tell one the winning story from two different perspectives: the summary metrics and the fundamentals are the same signal dressed up differently.
+
+## Predicted vs. Actual
+
+```{r pred-vs-actual}
+final_fit |>
+  collect_predictions() |>
+  ggplot(aes(wins, .pred)) +
+  geom_abline(slope = 1, intercept = 0, linetype = 2, color = "grey50") +
+  geom_point(alpha = 0.5) +
+  coord_obs_pred() +
+  labs(title = "Predicted vs. Actual Wins (FULL, test set)",
+       x = "Actual Wins", y = "Predicted Wins")
+```
+
+```{r pred-vs-actual-pure}
+final_pure_fit |>
+  collect_predictions() |>
+  ggplot(aes(wins, .pred)) +
+  geom_abline(slope = 1, intercept = 0, linetype = 2, color = "grey50") +
+  geom_point(alpha = 0.5) +
+  coord_obs_pred() +
+  labs(title = "Predicted vs. Actual Wins (PURE, test set)",
+       x = "Actual Wins", y = "Predicted Wins")
+```
+
+Both models follow the test set win totals tightly along the `y = x` line. The full and pure scatterplots are visually near-identical, echoing our previous result.
+
+## Conclusion
+
+In this project we set out to predict NBA regular-season win totals and, more specifically, to test how much of that prediction depends on summary margin metrics that are basically tautological with winning. Across four model families and two predictor sets, the best models predicted test-set win totals to within about 3.3 wins (R-Squared = 0.921), with the elastic net the strongest engine, narrowly. The premier result is the comparison between our two recipes: the pure model, restricted to fundamental score metrics, matched and even slightly beat the full model that included Net Rating and SRS. The much-hyped margin metrics, it turns out, add no predictive information once the underlying shooting, rebounding, turnover, and defensive components are present. 
+
+There are, however, several limitations that bind these conclusions. The data are team-season aggregates, so they say nothing about injuries, mid-season roster changes, or individual players, and so the relationships are descriptive rather than causal. Some lines of future research or model extension include modeling player-level inputs, fitting era-specific models to see whether the value of each fundamental has changed over time, and treating playoff success as a properly specified outcome of its own.
+
+# Codebook
+
+A complete codebook describing every variable is included in the separate file `codebook.txt`.
+
+# Sources
+
+- Basketball Reference: https://www.basketball-reference.com/
+- `tidymodels` documentation: https://www.tidymodels.org/

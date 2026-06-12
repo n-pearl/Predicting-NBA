@@ -1,0 +1,59 @@
+
+CODEBOOK - Predicting NBA Regular Season Win Totals (2000–2026)
+================================================================
+
+Source: Basketball Reference (Sports Reference LLC), https://www.basketball-reference.com/
+Tables: Team Per 100 Possessions (Team + Opponent), Team Advanced
+Unit of observation: one team's single regular season
+N = 805 team-seasons (27 seasons, 1999-00 through 2025-26)
+
+
+
+IDENTIFIERS (kept, not modeled on)
+
+season          int     Season end year (2016 = 2015-16 season).
+team            chr     Full team name for that season.
+era             factor  Derived: 2000-2007 / 2008-2014 / 2015-2026.
+
+
+OUTCOME
+
+wins            int     Regular season wins (0-82). Regression response.
+
+
+
+CONTEXT PREDICTORS (both recipes)
+
+age             num     Minutes-weighted average roster age.
+pace            num     Possessions per 48 minutes.
+sos             num     Strength of Schedule (avg opponent strength, pts).
+
+
+MARGIN / DERIVED METRICS  (FULL recipe ONLY)
+
+off_rtg         num     Offensive Rating: points scored per 100 poss.
+def_rtg         num     Defensive Rating: points allowed per 100 poss.
+net_rtg         num     off_rtg - def_rtg; per-possession point margin.
+srs             num     Simple Rating System: point margin adj. for schedule.
+
+
+PURE OFFENSE COMPONENTS (both recipes)
+
+ts_pct          num     True Shooting % (efficiency incl. 3s and FTs).
+efg_pct         num     Effective FG % (weights made 3s 1.5x).
+fg3ar           num     3-point attempt rate (share of FGA from 3).
+ftr             num     Free throw rate (FTA per FGA).
+tov_pct         num     Turnover percentage (turnovers per 100 plays).
+orb_pct         num     Offensive rebound percentage.
+ast             num     Assists per 100 possessions.
+stl             num     Steals per 100 possessions.
+blk             num     Blocks per 100 possessions.
+
+
+PURE DEFENSE COMPONENTS (both recipes)
+
+opp_efg_pct     num     Opponent effective FG % allowed.
+opp_tov_pct     num     Opponent turnover % forced.
+opp_ft_rate     num     Opponent free throw rate allowed.
+drb_pct 	num     Defensive rebound percentage.
+
